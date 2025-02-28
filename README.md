@@ -6,13 +6,16 @@ A decentralized peer-to-peer lending platform built on the Stacks blockchain. Th
 - Funding existing loan requests
 - Loan repayment with interest
 - Full loan status tracking
+- Loan cancellation for unfunded loans
+- Emergency pause functionality
+- Configurable loan amount limits
 
-## Features
+## Security Features
 
-- Secure handling of STX transfers
+- Contract pause mechanism
+- Loan amount limits
+- Input validation
 - Role-based access control
-- Interest calculation
-- Loan status management
 - Comprehensive error handling
 
 ## Contract Functions
@@ -20,5 +23,13 @@ A decentralized peer-to-peer lending platform built on the Stacks blockchain. Th
 - create-loan: Create a new loan request
 - fund-loan: Fund an existing loan request
 - repay-loan: Repay a funded loan with interest
+- cancel-loan: Cancel an unfunded loan
 - get-loan: View loan details
 - get-loan-count: Get total number of loans
+- set-contract-state: Enable/disable contract (admin only)
+
+## Configuration
+
+- Minimum loan amount: 1 STX
+- Maximum loan amount: 100 STX
+- Maximum loan term: 52 weeks
