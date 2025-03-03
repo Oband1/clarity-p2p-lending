@@ -10,6 +10,8 @@
 (define-constant err-amount-too-high (err u105))
 (define-constant err-invalid-term (err u106))
 (define-constant err-insufficient-collateral (err u107))
+(define-constant err-invalid-status-transition (err u110))
+(define-constant err-grace-period-expired (err u111))
 
 ;; Contract status
 (define-data-var contract-enabled bool true)
@@ -17,6 +19,10 @@
 ;; Configuration
 (define-data-var max-loan-amount uint u100000000) ;; 100 STX
 (define-data-var min-loan-amount uint u1000000)   ;; 1 STX
+(define-data-var grace-period uint u144)          ;; ~1 day in blocks
+
+;; Events
+(define-data-var event-counter uint u0)
 
 ;; Data vars
 (define-map loans 
@@ -29,13 +35,19 @@
         interest-rate: uint,
         term-length: uint,
         start-height: (optional uint),
-        status: (string-ascii 20)
+        status: (string-ascii 20),
+        amount-repaid: uint,
+        last-payment-height: (optional uint)
     }
 )
 
 (define-map borrower-scores
     { borrower: principal }
-    { score: uint }
+    { 
+        score: uint,
+        total-loans: uint,
+        repaid-loans: uint
+    }
 )
 
 (define-data-var loan-counter uint u0)
@@ -54,21 +66,32 @@
     )
 )
 
-;; Public functions
-(define-public (set-contract-state (enabled bool))
-    (begin
-        (asserts! (is-contract-owner) err-owner-only)
-        (ok (var-set contract-enabled enabled))
+(define-private (is-valid-status-transition (current-status (string-ascii 20)) (new-status (string-ascii 20)))
+    (match current-status
+        "PENDING" (or (is-eq new-status "FUNDED") (is-eq new-status "CANCELLED"))
+        "FUNDED" (or (is-eq new-status "REPAYING") (is-eq new-status "DEFAULTED"))
+        "REPAYING" (or (is-eq new-status "REPAID") (is-eq new-status "DEFAULTED"))
+        false
     )
 )
 
-(define-public (create-loan (amount uint) (interest-rate uint) (term-length uint))
+(define-private (emit-event (event-type (string-ascii 20)) (loan-id uint))
+    (begin
+        (var-set event-counter (+ (var-get event-counter) u1))
+        (print { event-id: (var-get event-counter), type: event-type, loan-id: loan-id })
+        (ok true)
+    )
+)
+
+;; Public functions
+(define-public (create-loan (amount uint) (interest-rate uint) (term-length uint) (collateral uint))
     (let 
         (
             (loan-id (var-get loan-counter))
         )
         (asserts! (var-get contract-enabled) (err u108))
         (asserts! (validate-loan-params amount term-length) (err u109))
+        (try! (stx-transfer? collateral tx-sender (as-contract tx-sender)))
         (try! (stx-transfer? amount tx-sender (as-contract tx-sender)))
         (map-insert loans
             { loan-id: loan-id }
@@ -76,14 +99,17 @@
                 borrower: tx-sender,
                 lender: none,
                 amount: amount,
-                collateral: u0,
+                collateral: collateral,
                 interest-rate: interest-rate,
                 term-length: term-length,
                 start-height: none,
-                status: "PENDING"
+                status: "PENDING",
+                amount-repaid: u0,
+                last-payment-height: none
             }
         )
         (var-set loan-counter (+ loan-id u1))
+        (try! (emit-event "LOAN_CREATED" loan-id))
         (ok loan-id)
     )
 )
@@ -105,6 +131,7 @@
                 status: "FUNDED"
             })
         )
+        (try! (emit-event "LOAN_FUNDED" loan-id))
         (ok true)
     )
 )
@@ -113,40 +140,44 @@
     (let
         (
             (loan (unwrap! (map-get? loans { loan-id: loan-id }) err-invalid-loan))
-            (repayment-amount (+ (get amount loan) 
+            (total-owed (+ (get amount loan) 
                 (* (get amount loan) (get interest-rate loan) (get term-length loan))))
+            (current-repaid (get amount-repaid loan))
+            (remaining (- total-owed current-repaid))
         )
         (asserts! (var-get contract-enabled) (err u108))
         (asserts! (is-eq (get borrower loan) tx-sender) err-invalid-loan)
-        (asserts! (is-eq (get status loan) "FUNDED") err-invalid-loan)
-        (asserts! (>= amount repayment-amount) err-repayment-too-low)
-        (try! (stx-transfer? repayment-amount tx-sender (unwrap! (get lender loan) err-invalid-loan)))
-        (map-set loans
-            { loan-id: loan-id }
-            (merge loan {
-                status: "REPAID"
-            })
+        (asserts! (or (is-eq (get status loan) "FUNDED") 
+                    (is-eq (get status loan) "REPAYING")) err-invalid-loan)
+        (asserts! (<= amount remaining) err-amount-too-high)
+        (try! (stx-transfer? amount tx-sender (unwrap! (get lender loan) err-invalid-loan)))
+        
+        (let ((new-amount-repaid (+ current-repaid amount))
+              (new-status (if (>= new-amount-repaid total-owed) "REPAID" "REPAYING")))
+            (map-set loans
+                { loan-id: loan-id }
+                (merge loan {
+                    status: new-status,
+                    amount-repaid: new-amount-repaid,
+                    last-payment-height: (some block-height)
+                })
+            )
+            (try! (emit-event "LOAN_REPAYMENT" loan-id))
+            (ok true)
         )
-        (ok true)
     )
 )
 
-(define-public (cancel-loan (loan-id uint))
+(define-public (claim-collateral (loan-id uint))
     (let
         (
             (loan (unwrap! (map-get? loans { loan-id: loan-id }) err-invalid-loan))
+            (lender (unwrap! (get lender loan) err-invalid-loan))
         )
-        (asserts! (and 
-            (is-eq (get borrower loan) tx-sender)
-            (is-eq (get status loan) "PENDING")
-        ) err-invalid-loan)
-        (try! (as-contract (stx-transfer? (get amount loan) tx-sender (get borrower loan))))
-        (map-set loans
-            { loan-id: loan-id }
-            (merge loan {
-                status: "CANCELLED"
-            })
-        )
+        (asserts! (is-eq tx-sender lender) err-owner-only)
+        (asserts! (is-eq (get status loan) "DEFAULTED") err-invalid-loan)
+        (try! (as-contract (stx-transfer? (get collateral loan) tx-sender lender)))
+        (try! (emit-event "COLLATERAL_CLAIMED" loan-id))
         (ok true)
     )
 )
